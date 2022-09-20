@@ -1,4 +1,3 @@
-from importlib.metadata import distribution
 import torch
 
 from monai.data import (
@@ -8,7 +7,6 @@ from monai.data import (
     load_decathlon_datalist,
     decollate_batch,
 )
-import matplotlib.pyplot as plt
 
 from monai.transforms import (
     AsDiscrete,
@@ -25,13 +23,14 @@ from monai.transforms import (
     RandRotate90d,
 )
 from monai.losses import DiceLoss
-
-
-from models import SegmentationNet, SelectionNet
-device_0 = "cuda:0"
-device_1 = "cuda:1"
-
-
+from loss import weighted_mmd, batch_wise_loss, dice_metric
+from monai.networks.nets.swin_unetr import SwinUNETR
+from model import SelectionNet
+device_0 = "cuda:1" # device f_seg lives
+device_1 = "cuda:0" # device f_select lives
+sigma=0.01
+num_of_img_to_train = 4
+num_of_val = num_of_img_to_train // 4
 
 train_transforms = Compose(
     [
@@ -90,7 +89,7 @@ train_transforms = Compose(
     ]
 )
 
-data_dir = "/raid/candi/xiangcen/ahnet/Task07_Pancreas/dataset.json"
+data_dir = "./data/Task07_Pancreas/dataset.json"
 datalist = load_decathlon_datalist(data_dir, True, "training")
 
 D_test = datalist[:21]
@@ -104,7 +103,7 @@ seg_ds = Dataset(
     transform=train_transforms,
 )
 seg_loader = DataLoader(
-    seg_ds, batch_size=4, shuffle=False,
+    seg_ds, batch_size=num_of_img_to_train, shuffle=False,
 )
 
 
@@ -113,121 +112,101 @@ selection_ds = Dataset(
     transform=train_transforms,
 )
 selection_loader = DataLoader(
-    selection_ds, batch_size=4, shuffle=False,
+    selection_ds, batch_size=num_of_img_to_train, shuffle=False,
 )
 
+# Set the networks and their optimizers
+f_seg = SwinUNETR((64, 64, 64), 1, 3).to(device_0)
+f_select = SelectionNet().to(device_1)
+f_seg_optimizer = torch.optim.Adam(f_seg.parameters(), lr=0.005)
+f_select_optimizer = torch.optim.Adam(f_select.parameters(), lr=0.1)
 
 
-
-
-dice_loss = DiceLoss(
-    include_background=True,
-    to_onehot_y=True,
-    softmax=True,
-    reduction="none",
-)
-
-def Weighted_MMD(distribution_0, alpha_0, distribution_1, alpha_1):
-    return distribution_0.sum()+alpha_0.sum() + distribution_1.sum() + alpha_1.sum()
-
-
-
-
-def result_transfer(l, alpha):
-    """
-    create two instance of loss (from the f_seg) and alpha (from the f_select)
-    on two gpus (f_seg for device_0 and f_select for device_1)
+# variables with tag 0 or 1 indicate that this variable is on or should locate at device_0 or device_1
+# The f_seg and f_select are trained at the same time with two gpus. (f_seg on device_0, f_select on device_1)
+def init_data(batch_0, batch_1):
+    """A batch is from one loop of the dataloader iterator
+    We need to predict meta segmentation and meta selection dataset by two networks which lives on two gpus,
+    so each gpu get a copy of their corrsponding data that need to be calculated.
 
     Args:
-        l (torch.tensor): The dice loss created by f_seg on device_0
-        alpha (torch.tensor): The representativeness index created by f_select on device_1
+        batch_0 : A batch from meta segmentation dataset (currently on cpu)
+        batch_1 : A batch from meta selection dataset (currently on cpu)
+
+    Returns:
+        tuple: 6 data
     """
-    
-    l_0 = l.to(device_0)
-    l_1 = l.to(device_1)
-    alpha_0 = alpha.to(device_0)
-    alpha_1 = alpha.to(device_1)
-    return l_0, alpha_0, l_1, alpha_1
-
-def gpu_transfer(a, b):
-    
-    
-    a_0 = a.to(device_0)
-    a_1 = a.to(device_1)
-    b_0 = b.to(device_0)
-    b_1 = b.to(device_1)
-    return a_0, a_1, b_0, b_1
-
-
-f_seg = SegmentationNet().to(device_0)
-f_select = SelectionNet().to(device_1)
-f_seg_optimizer = torch.optim.SGD(f_seg.parameters(), lr=0.1)
-f_select_optimizer = torch.optim.SGD(f_select.parameters(), lr=0.1)
-
-
-
-
-def init_data(batch_0, batch_1):
-
     # sample the data and copy them on two gpus
     img_seg, label_seg = batch_0["image"], batch_0["label"]
     img_select, label_select = batch_1["image"], batch_1["label"]
-    # copy and send
+    
+    # For training f_seg network, a copy of the img should send to device_1 to and calculate the alphas by f_select(img)
+    # and of course img and label on device_1 to calculate loss by dice(f_seg(img), lable)
     img_seg_0, label_seg_0, img_seg_1 = img_seg.to(device_0), label_seg.to(device_0), img_seg.to(device_1)
+    # For training f_select network both img and label should send to f_seg to calculate the 
+    # dice metric by dice_metric(f_seg(img), lable), and only the img on device_1 to calculate the alpha
     img_select_1, img_select_0, label_select_0 = img_select.to(device_1), img_select.to(device_0), label_select.to(device_0)
+    # Train f_seg : segmentation img (device_0)
+    #               segmentation label (device_0)
+    #               selection img (device_1)
+    # Train f_selection : selection img (device_1)
+    #                     selection img (device_0)
+    #                     selection label (device_0)
     return img_seg_0, label_seg_0, img_seg_1, img_select_1, img_select_0, label_select_0
 
 
 def train_f_seg(img_seg_0, label_seg_0, img_seg_1, f_seg, f_select, f_seg_optimizer):
+    # In general f_seg network's parameter lives on device_0 calculate the alpha values 
+    # from device_1 and transfer it to device_0 and named those variables alpha_0
     with torch.no_grad():
         f_select.eval()
+        # make sure alpha_0's shape is (B, 1) so that it could multiply loss_0
         alpha_0 = f_select(img_seg_1).to(device_0)
-    f_select.train()
+    f_seg.train()
     pred_0 = f_seg(img_seg_0)
-    loss_0 = torch.mean(dice_loss(pred_0, label_seg_0).flatten(2), dim=1)
-    print(loss_0.shape)
-    loss_0 = torch.mean(loss_0*alpha_0, dim=0)
-    print(loss_0.shape)
+    # make sure the loss_0' shape is (B, 1) so that it could multiply (1 - alpha)
+    loss_0 = batch_wise_loss(pred_0, label_seg_0)
+    # loss multiply the (1 - alpha)
+    loss_0 = torch.mean(loss_0*(1 - alpha_0), dim=0) # After multiplty (1 - alpha) calculate batch-wise mean 
+                                                     # of the loss to make this a number for backprop
+    
     
     loss_0.backward()
     f_seg_optimizer.step()
+    f_seg_optimizer.zero_grad()
+    # return the loss for monitoring purpose
     return loss_0.item()
 
 
 def train_f_select(img_select_1, img_select_0, label_select_0, f_select, f_seg, f_select_optimizer):
+    # calculate the dice score of img_select on device_0 and send it to device_1 as loss_1
     with torch.no_grad():
         f_seg.eval()
         pred_0 = f_seg(img_select_0)
-        loss_1 = dice_loss(pred_0, label_select_0).flatten(2).to(device_1)
-        
-    f_seg.train()
+        loss_1 = classed_batch_wise_loss(pred_0, label_select_0).to(device_1)
+
+
+    f_select.train()
     alpha_1 = f_select(img_select_1)
     # find the largest alpha(s)
-    top_k_indices = torch.topk(alpha_1, k=1, dim=0)[1].squeeze(0)
+    top_k_indices = torch.topk(alpha_1, k=num_of_val, dim=0)[1].squeeze(0)
+    print("topkindex: ", top_k_indices)
+    # take the indices
     distribution_val, alpha_val =  loss_1[top_k_indices], alpha_1[top_k_indices]
-    print(distribution_val.shape, alpha_val.shape, loss_1.shape, alpha_1.shape)
-    loss_1 = Weighted_MMD(distribution_val, alpha_val, loss_1, alpha_1)
+    
+    loss_1 = weighted_mmd(distribution_val, alpha_val, loss_1/2., alpha_1, sigma)
     loss_1.backward()
     f_select_optimizer.step()
+    print("grad:", f_select.check_term.grad)
+    print("grad:", f_select.qkv.weight.grad)
+    f_select_optimizer.zero_grad()
     return loss_1.item()
 
 
 
 
+if __name__ == "__main__":
+
+    pass
 
 
-for batch_0, batch_1 in zip(seg_loader, selection_loader):
-    img_seg_0, label_seg_0, img_seg_1, img_select_1, img_select_0, label_select_0 = init_data(batch_0, batch_1)
-    # loss = train_f_seg(img_seg_0, label_seg_0, img_seg_1, f_seg, f_select, f_seg_optimizer)
-    print(f_select.qkv.weight)
-    train_f_select(img_select_1, img_select_0, label_select_0, f_select, f_seg, f_select_optimizer)
-    print(f_select.qkv.weight)
-    break
-
-
-
-
-#### To Do List
-"""
-Define a helper function for the dice loss so that it could produce dice loss for all the individual loss inside a batch
-"""
