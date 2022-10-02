@@ -28,14 +28,14 @@ from monai.networks.nets.swin_unetr import SwinUNETR
 from model import SelectionNet
 from tools import delete_from_gpu, change_zero
 #################################################
-CUDA_LAUNCH_BLOCKING="1"
+
 # Hyperparameters
 device_0 = "cuda:2" # device f_seg lives
 device_1 = "cuda:2" # device f_select lives
 sigma=5
 
-num_batch = 12
-num_of_val = num_batch // 4
+num_batch = 20
+num_of_val = num_batch // 5
 
 data_dir = "./data/Task07_Pancreas/dataset.json"
 datalist = load_decathlon_datalist(data_dir, True, "training")
@@ -71,9 +71,9 @@ train_transforms = Compose(
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
-            spatial_size=(64, 64, 64),
+            spatial_size=(128, 128, 64),
             pos=1,
-            neg=1,
+            neg=1.5,
             num_samples=1,
             image_key="image",
             image_threshold=0,
@@ -149,9 +149,13 @@ select_transforms = Compose(
 # seg_loader = DataLoader(
 #     seg_ds, batch_size=num_batch, shuffle=True, drop_last=False
 # )
-selection_ds = Dataset(
+selection_ds = CacheDataset(
     data=D_meta_select,
     transform=select_transforms,
+    cache_num = 32,
+    cache_rate=1.0,
+    num_workers=8,
+
 )
 selection_loader = DataLoader(
     selection_ds, batch_size=num_batch, shuffle=True, drop_last=True
@@ -162,131 +166,134 @@ f_seg = SwinUNETR((64, 64, 64), 1, 3).to(device_0)
 f_seg.load_state_dict(torch.load("/raid/candi/xiangcen/meta_data_select/model/f_seg_v0.pt"))
 f_select = SelectionNet().to(device_1)
 # f_seg_optimizer = torch.optim.Adam(f_seg.parameters(), lr=0.005)
-f_select_optimizer = torch.optim.Adam(f_select.parameters(), lr=0.001)
+f_select_optimizer = torch.optim.SGD(f_select.parameters(), lr=1e-4, momentum=0.9, weight_decay=1e-5)
 
 
-def init_data(batch_0, batch_1):
-    """
-    A batch is from one loop of the dataloader iterator
-    We need to calculate result of meta segmentation and meta selection dataset 
-    by two networks which lives on two gpus, so each gpu get a copy of their corrsponding 
-    data that need to be calculated.
+# def init_data(batch_0, batch_1):
+#     """
+#     A batch is from one loop of the dataloader iterator
+#     We need to calculate result of meta segmentation and meta selection dataset 
+#     by two networks which lives on two gpus, so each gpu get a copy of their corrsponding 
+#     data that need to be calculated.
 
-    variables with tag 0 or 1 indicate that this variable is on or should 
-    locate at device_0 or device_1. The f_seg and f_select are trained at 
-    the same time with two gpus. (f_seg on device_0, f_select on device_1)
+#     variables with tag 0 or 1 indicate that this variable is on or should 
+#     locate at device_0 or device_1. The f_seg and f_select are trained at 
+#     the same time with two gpus. (f_seg on device_0, f_select on device_1)
 
-    Args:
-        batch_0 : A batch from meta segmentation dataset (currently on cpu)
-        batch_1 : A batch from meta selection dataset (currently on cpu)
+#     Args:
+#         batch_0 : A batch from meta segmentation dataset (currently on cpu)
+#         batch_1 : A batch from meta selection dataset (currently on cpu)
 
-    Returns:
-        tuple: 6 data
-    """
-    # sample the data and copy them on two gpus
-    img_seg, label_seg = batch_0["image"], batch_0["label"]
-    img_select, label_select = batch_1["image"], batch_1["label"]
+#     Returns:
+#         tuple: 6 data
+#     """
+#     # sample the data and copy them on two gpus
+#     img_seg, label_seg = batch_0["image"], batch_0["label"]
+#     img_select, label_select = batch_1["image"], batch_1["label"]
     
-    # For training f_seg network, a copy of the img should send to device_1 to and calculate the alphas by f_select(img)
-    # and of course img and label on device_1 to calculate loss by dice(f_seg(img), lable)
-    img_seg_0, label_seg_0, img_seg_1 = img_seg.to(device_0), label_seg.to(device_0), img_seg.to(device_1)
-    # For training f_select network both img and label should send to f_seg to calculate the 
-    # dice metric by dice_metric(f_seg(img), lable), and only the img on device_1 to calculate the alpha
-    img_select_1, img_select_0, label_select_0 = img_select.to(device_1), img_select.to(device_0), label_select.to(device_0)
-    # Train f_seg : segmentation img (device_0)
-    #               segmentation label (device_0)
-    #               selection img (device_1)
-    # Train f_selection : selection img (device_1)
-    #                     selection img (device_0)
-    #                     selection label (device_0)
-    return img_seg_0, label_seg_0, img_seg_1, img_select_1, img_select_0, label_select_0
+#     # For training f_seg network, a copy of the img should send to device_1 to and calculate the alphas by f_select(img)
+#     # and of course img and label on device_1 to calculate loss by dice(f_seg(img), lable)
+#     img_seg_0, label_seg_0, img_seg_1 = img_seg.to(device_0), label_seg.to(device_0), img_seg.to(device_1)
+#     # For training f_select network both img and label should send to f_seg to calculate the 
+#     # dice metric by dice_metric(f_seg(img), lable), and only the img on device_1 to calculate the alpha
+#     img_select_1, img_select_0, label_select_0 = img_select.to(device_1), img_select.to(device_0), label_select.to(device_0)
+#     # Train f_seg : segmentation img (device_0)
+#     #               segmentation label (device_0)
+#     #               selection img (device_1)
+#     # Train f_selection : selection img (device_1)
+#     #                     selection img (device_0)
+#     #                     selection label (device_0)
+#     return img_seg_0, label_seg_0, img_seg_1, img_select_1, img_select_0, label_select_0
 
 
-def train_f_seg(img_seg_0, label_seg_0, img_seg_1, f_seg, f_select, f_seg_optimizer):
-    """
-    In general f_seg network's parameter lives on device_0 calculate the alpha values 
-    from device_1 and transfer it to device_0 and named those variables alpha_0
+# def train_f_seg(img_seg_0, label_seg_0, img_seg_1, f_seg, f_select, f_seg_optimizer):
+#     """
+#     In general f_seg network's parameter lives on device_0 calculate the alpha values 
+#     from device_1 and transfer it to device_0 and named those variables alpha_0
 
-    Args:
-        img_seg_0 (torch.tensor): segmentation img (device_0)
-        label_seg_0 (torch.tensor): segmentation label (device_0)
-        img_seg_1 (torch.tensor): selection img (device_1)
-        f_seg (nn.Module): segmentaiton network (device_0)
-        f_select (nn.Module): selection network (device_1)
-        f_seg_optimizer (torch.optim): optimizer for f_seg network
+#     Args:
+#         img_seg_0 (torch.tensor): segmentation img (device_0)
+#         label_seg_0 (torch.tensor): segmentation label (device_0)
+#         img_seg_1 (torch.tensor): selection img (device_1)
+#         f_seg (nn.Module): segmentaiton network (device_0)
+#         f_select (nn.Module): selection network (device_1)
+#         f_seg_optimizer (torch.optim): optimizer for f_seg network
 
-    Returns:
-        loss of current batch (step): float
-    """
-    with torch.no_grad():
-        f_select.eval()
-        # make sure alpha_0's shape is (B, 1) so that it could multiply loss_0
-        # alpha_0 -> [B, 1]
-        alpha_0 = f_select(img_seg_1).to(device_0)
-        delete_from_gpu(img_seg_1)
-    f_seg.train()
-    pred_0 = f_seg(img_seg_0)
-    # make sure the loss_0' shape is (B, 1) so that it could multiply (1 - alpha)
-    loss_0 = batch_wise_loss(pred_0, label_seg_0)
-    # loss multiply the (1 - alpha)
-    loss_0 = torch.mean(loss_0*(1 - alpha_0), dim=0) # After multiplty (1 - alpha) calculate batch-wise mean 
-                                                     # of the loss to make this a number for backprop
+#     Returns:
+#         loss of current batch (step): float
+#     """
+#     with torch.no_grad():
+#         f_select.eval()
+#         # make sure alpha_0's shape is (B, 1) so that it could multiply loss_0
+#         # alpha_0 -> [B, 1]
+#         alpha_0 = f_select(img_seg_1).to(device_0)
+#         delete_from_gpu(img_seg_1)
+#     f_seg.train()
+#     pred_0 = f_seg(img_seg_0)
+#     # make sure the loss_0' shape is (B, 1) so that it could multiply (1 - alpha)
+#     loss_0 = batch_wise_loss(pred_0, label_seg_0)
+#     # loss multiply the (1 - alpha)
+#     loss_0 = torch.mean(loss_0*(1 - alpha_0), dim=0) # After multiplty (1 - alpha) calculate batch-wise mean 
+#                                                      # of the loss to make this a number for backprop
     
-    # Train the parameter for a step!!!
-    loss_0.backward()
-    f_seg_optimizer.step()
-    f_seg_optimizer.zero_grad()
-    # return the loss for monitoring purpose
-    return loss_0.item()
+#     # Train the parameter for a step!!!
+#     loss_0.backward()
+#     f_seg_optimizer.step()
+#     f_seg_optimizer.zero_grad()
+#     # return the loss for monitoring purpose
+#     return loss_0.item()
 
 def my_celoss(alpha, label):
-    loss = -label*torch.log(alpha.softmax(0))
+    loss = -label*torch.log(alpha)
     return loss.mean()
 
-def train_f_select(img_select_1, img_select_0, label_select_0, f_select, f_seg, f_select_optimizer):
-    """
-    In general f_selection network's parameter lives on device_1 calculate the dice score values 
-    from device_1 and transfer it to device_0 and named those variables loss_1
+def mse_loss(x, y):
+    o = torch.norm(x-y, dim=0)
+    return o / num_batch
 
-    Args:
-        img_select_1 (torch.tensor): selection img (device_1)
-        img_select_0 (torch.tensor): selection img (device_0)
-        label_select_0 (torch.tensor): selection label (device_0)
-        f_select (nn.Module): selection network (device_1)
-        f_seg (nn.Module): selection network (device_1)
-        f_select_optimizer (torch.optim): f_select network
+# def train_f_select(img_select_1, img_select_0, label_select_0, f_select, f_seg, f_select_optimizer):
+#     """
+#     In general f_selection network's parameter lives on device_1 calculate the dice score values 
+#     from device_1 and transfer it to device_0 and named those variables loss_1
 
-    Returns:
-        float: loss score for current batch
-    """
-    # calculate the dice score of img_select on device_0 and send it to device_1 as loss_1
-    with torch.no_grad():
-        f_seg.eval()
-        pred_0 = f_seg(img_select_0)
-        # loss_1 -> [B, num_class]
-        loss_1 = dice_metric(pred_0, label_select_0).to(device_1)
-        loss_1 = change_zero(loss_1, 0.001)
-        print(loss_1)
-        delete_from_gpu(img_select_0, label_select_0)
-        label = create_label(num_batch, loss_1)
+#     Args:
+#         img_select_1 (torch.tensor): selection img (device_1)
+#         img_select_0 (torch.tensor): selection img (device_0)
+#         label_select_0 (torch.tensor): selection label (device_0)
+#         f_select (nn.Module): selection network (device_1)
+#         f_seg (nn.Module): selection network (device_1)
+#         f_select_optimizer (torch.optim): f_select network
 
-
-    f_select.train()
-    alpha_1 = f_select(img_select_1)
-    print(alpha_1)
-
-    loss_1 = my_celoss(alpha_1, label)
-    print(loss_1)
-
-    loss_1.backward()
-    f_select_optimizer.step()
-    f_select_optimizer.zero_grad()
-    return loss_1.item()
+#     Returns:
+#         float: loss score for current batch
+#     """
+#     # calculate the dice score of img_select on device_0 and send it to device_1 as loss_1
+#     with torch.no_grad():
+#         f_seg.eval()
+#         pred_0 = f_seg(img_select_0)
+#         # loss_1 -> [B, num_class]
+#         loss_1 = dice_metric(pred_0, label_select_0).to(device_1)
+#         loss_1 = change_zero(loss_1, 0.001)
+#         print(loss_1)
+#         delete_from_gpu(img_select_0, label_select_0)
+#         label = create_label(num_batch, loss_1)
 
 
-loss_function = torch.nn.BCELoss()
+#     f_select.train()
+#     alpha_1 = f_select(img_select_1)
+#     print(alpha_1)
+
+#     loss_1 = my_celoss(alpha_1, label)
+#     print(loss_1)
+
+#     loss_1.backward()
+#     f_select_optimizer.step()
+#     f_select_optimizer.zero_grad()
+#     return loss_1.item()
 if __name__ == "__main__":
+    loss_function = torch.nn.BCELoss()
     Epochs = 300
+    loss_list = []
     for epoch in range(Epochs):
         for step, batch in enumerate(selection_loader):
             img, label = batch["image"].to(device_1), batch["label"].to(device_1) 
@@ -305,6 +312,8 @@ if __name__ == "__main__":
             print(alpha)
             loss = loss_function(alpha, alpha_label)
             loss.backward()
+            loss_list.append(loss.item())
+            torch.save(torch.tensor(loss_list), "./loss_per_iteration.pt")
 
             f_select_optimizer.step()
             f_select_optimizer.zero_grad()
