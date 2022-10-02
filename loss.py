@@ -10,7 +10,7 @@ dice_loss = DiceLoss(
     to_onehot_y=True,
     softmax=True,
     reduction="none",
-)  
+)
 
 def batch_wise_loss(pred, label):
     # returns the dice loss for each batch
@@ -97,8 +97,7 @@ def term(l_small, l_big, sigma):
     k = kernel(l2_norm, sigma)
 
     
-
-    return k.sum()
+    return k.sum() / (b_small*b_big)
 
 
 def mmd(distribution_0, distribution_1, sigma):
@@ -116,90 +115,70 @@ def mmd(distribution_0, distribution_1, sigma):
 
 
 
-def create_label(num_batch, predicted_dice):
+def create_label(num_batch, predicted_dice, sigma=1.):
     num_val = num_batch // 4
     i_all = torch.arange(0, num_batch, 1, dtype=torch.long).tolist()
     combinations = torch.combinations(torch.arange(0, num_batch, 1, dtype=torch.long), r=num_val)
 
-    smallest_loss, best_comb = 0., None
+    smallest_loss, best_comb = 100000., None
     for comb in combinations:
         comb = comb.tolist()
         val_dice = predicted_dice[comb]
         train_dice = predicted_dice[[x for x in i_all if x not in comb]]
         
-        mmd_loss = mmd(val_dice, train_dice, 5)
+        mmd_loss = mmd(val_dice, train_dice, sigma)
         # print(mmd_loss)
-        if mmd_loss > smallest_loss:
+        if mmd_loss < smallest_loss:
             smallest_loss = mmd_loss
             best_comb = comb
 
     label = torch.zeros(num_batch, device=predicted_dice.device)
     label[best_comb] = 1.
     
-    return label.view(num_batch, 1)
+    return label.view(num_batch, 1) / num_val
 
-
-
-
-# if __name__ == "__main__":
-#     l_all = torch.tensor([
-#         [ 0.45, 0.45],
-#         [0.9, 0.9],
-#         [0.1, 0.1],
-#         [0.6, 0.5],
-#         [0.48, 0.47],
-#         [0.943, 0.9432],
-#         [0.1432, 0.1432],
-#         [0.6432, 0.5432]
-#     ])
-#     alpha_all_bad = torch.tensor([
-#         [0.1],
-#         [0.998],
-#         [0.996],
-#         [0.994],
-#         [0.1],
-#         [0.993],
-#         [0.999],
-#         [0.991]
-#     ])
-#     alpha_all_good = torch.tensor([
-#         [0.999],
-#         [0.001],
-#         [0.0012],
-#         [0.0032],
-#         [0.996],
-#         [0.004],
-#         [0.003],
-#         [0.08]
-#     ])
-
-
-#     # # a parameter to test the gradient
-#     p = torch.tensor([1.], requires_grad=True)
-#     alpha_all = p*alpha_all_good
-#     l_val = l_all[torch.tensor([0, 4])]
-#     alpha_val = alpha_all_good[torch.tensor([0, 4])]
+if __name__ == "__main__":
+    l_all = torch.tensor([
+        [ 0.498, 0.443],
+        [0.465, 0.432],
+        [0.465, 0.432],
+        [0.465, 0.432],
+        [0.1432, 0.1213],
+        [0.14321, 0.14321],
+        [0.1432, 0.1213],
+        [0.14321, 0.14321],
+        [0.1543, 0.17654],
+        [0.1543, 0.17654],
+        [0.9654, 0.9454],
+        [0.9987, 0.9345],
+        [0.9654, 0.9454],
+        [0.976, 0.9562],
+        [0.9987, 0.9345],
+        [0.976, 0.9562]
+    ])
     
+    loss_function = torch.nn.BCELoss()
     
-#     o = weighted_mmd(l_val, alpha_val, l_all, alpha_all, 0.1)
-#     o.backward()
-#     print("good prediction------------------------------")
-#     print("gradient: ", p.grad, "loss: ", o)
+    # l_all = torch.rand(16, 1)
+    print(l_all)
+    label = create_label(16, l_all, .25)
+    print(label)
+
+
+
+    x = torch.tensor([
+        [0.9], 
+        [0.1]
+    ])
+
+    label = torch.tensor([
+        [1.],
+        [0.]
+    ])
+
+    print(loss_function(x, label))
     
 
 
-# ##################################################
-#     p = torch.tensor([1.], requires_grad=True)
-#     alpha_all = p*alpha_all_bad
-#     l_val = l_all[torch.tensor([0, 4])]
-#     alpha_val = alpha_all_bad[torch.tensor([0, 4])]
-    
-    
-
-    
-#     o = weighted_mmd(l_val, alpha_val, l_all, alpha_all, 0.1)
-#     o.backward()
-#     print("good prediction------------------------------")
-#     print("gradient: ", p.grad, "loss: ", o)
     
     
