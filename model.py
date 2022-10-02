@@ -8,43 +8,50 @@ class SelectionNet(nn.Module):
         super().__init__()
         self.relu = nn.ReLU()
         
-        self.down_sample = DownSample([1, 32, 128, 256, 512, 1024])
+        self.down_sample = DownSample([2, 32, 128, 256, 512, 1024])
 
 
-        self.test_average_pool = nn.AvgPool3d(2)
+        self.pool_to_vector = nn.AvgPool3d(2)
 
-        self.attention = BatchAttentionModulle(1024, 2)
 
-        self.test_linear = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.Dropout(0.05),
-            nn.ReLU(),
-            nn.Linear(512, 1),
-            # nn.ReLU(),
-            # nn.Softmax(0)
-            nn.Sigmoid()
+        self.attention = nn.Sequential(
+            BatchAttentionModulle(1024, 2, 2),
+            BatchAttentionModulle(1024, 2, 2, 512),
+
+            BatchAttentionModulle(512, 2, 1),
+            BatchAttentionModulle(512, 2, 1, 128),
+
+            BatchAttentionModulle(128, 2, 1),
+            BatchAttentionModulle(128, 2, 1, 1),
         )
+
+        
+
 
     def forward(self, x):
         skip_list = self.down_sample(x)
-
         test_feature_map = skip_list
-        feature = self.test_average_pool(test_feature_map).flatten(1)
+        feature = self.pool_to_vector(test_feature_map).flatten(1) # [B, feature]
+        output = self.attention(feature)
+
+        return output
+
+    
 
 
-        feature = self.attention(feature)
+
+
+
         
-        
-        return self.test_linear(feature)
 
 
 class DownSample(nn.Module):
 
-    def __init__(self, feature_list=[1, 32, 128, 256, 512, 1024], unet_shape=False):
+    def __init__(self, feature_list=[2, 32, 128, 256, 512, 1024], unet_shape=False):
         super().__init__()
         self.feature_list = feature_list
         self.unet_shape = unet_shape
-        self.init_bn = nn.BatchNorm3d(1)
+        self.init_bn = nn.BatchNorm3d(2)
         self.down_0 = self._make_down(0)
         self.down_1 = self._make_down(1)
         self.down_2 = self._make_down(2)
@@ -142,7 +149,7 @@ class BatchAttentionModulle(nn.Module):
         skip_0 = x
         qkv = self.qkv(x).reshape(batch_size, 3, self.num_head, vector_size // self.num_head).permute(1, 2, 0, 3)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = self.tanh(q), self.tanh(k)
+        # q, k = self.tanh(q), self.tanh(k)
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
         x = (attn @ v).transpose(0, 1).flatten(1) + skip_0
@@ -171,10 +178,13 @@ if __name__ == "__main__":
     device = "cuda:2"
     model = SelectionNet().to(device)
     # model = DownSample([1, 32, 128, 256, 512, 2048]).to(device)
-    x = torch.rand(4, 1, 64, 64, 64).to(device)
-    print(model(x).shape)
+    x = torch.rand(16, 1, 64, 64, 64).to(device)
+    print(model(x))
 
     # model = BatchAttentionModulle(1024, 2, 2, 512).to(device)
     # x = torch.rand(4, 1024).to(device)
 
     # print(model(x).shape)
+
+    
+
