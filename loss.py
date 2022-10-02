@@ -115,8 +115,8 @@ def mmd(distribution_0, distribution_1, sigma):
 
 
 
-def create_label(num_batch, predicted_dice, sigma=1.):
-    num_val = num_batch // 4
+def create_label(num_batch, predicted_dice, smooth=0.1, sigma=1.):
+    num_val = num_batch // 5
     i_all = torch.arange(0, num_batch, 1, dtype=torch.long).tolist()
     combinations = torch.combinations(torch.arange(0, num_batch, 1, dtype=torch.long), r=num_val)
 
@@ -132,10 +132,10 @@ def create_label(num_batch, predicted_dice, sigma=1.):
             smallest_loss = mmd_loss
             best_comb = comb
 
-    label = torch.zeros(num_batch, device=predicted_dice.device)
-    label[best_comb] = 1.
+    label = smooth*torch.ones(num_batch, device=predicted_dice.device)
+    label[best_comb] = 1. - smooth
     
-    return label.view(num_batch, 1) / num_val
+    return label.view(num_batch, 1)
 
 if __name__ == "__main__":
     l_all = torch.tensor([
