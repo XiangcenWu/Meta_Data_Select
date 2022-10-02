@@ -25,7 +25,10 @@ class SelectionNet(nn.Module):
             BatchAttentionModulle(128, 2, 1, 1),
         )
 
-        
+        # self.without_sequence = nn.Sequential(
+        #     nn.Linear(1024, 1),
+        #     nn.Sigmoid(),
+        # )
 
 
     def forward(self, x):
@@ -33,8 +36,8 @@ class SelectionNet(nn.Module):
         test_feature_map = skip_list
         feature = self.pool_to_vector(test_feature_map).flatten(1) # [B, feature]
         output = self.attention(feature)
-
-        return output
+        
+        return torch.sigmoid(output)
 
     
 
@@ -152,6 +155,7 @@ class BatchAttentionModulle(nn.Module):
         # q, k = self.tanh(q), self.tanh(k)
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
+        attn = attn.softmax(-1)
         x = (attn @ v).transpose(0, 1).flatten(1) + skip_0
         x = self.layernorm_attn(x)
 
@@ -178,13 +182,16 @@ if __name__ == "__main__":
     device = "cuda:2"
     model = SelectionNet().to(device)
     # model = DownSample([1, 32, 128, 256, 512, 2048]).to(device)
-    x = torch.rand(16, 1, 64, 64, 64).to(device)
+    x = torch.rand(16, 2, 64, 64, 64).to(device)
     print(model(x))
 
     # model = BatchAttentionModulle(1024, 2, 2, 512).to(device)
     # x = torch.rand(4, 1024).to(device)
 
     # print(model(x).shape)
+
+    
+
 
     
 
